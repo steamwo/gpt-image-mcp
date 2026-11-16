@@ -23,32 +23,26 @@ jobs:
             goos: linux
             goarch: amd64
             ext: ''
-            archive: tar
           - name: linux-arm64
             goos: linux
             goarch: arm64
             ext: ''
-            archive: tar
           - name: darwin-amd64
             goos: darwin
             goarch: amd64
             ext: ''
-            archive: tar
           - name: darwin-arm64
             goos: darwin
             goarch: arm64
             ext: ''
-            archive: tar
           - name: windows-amd64
             goos: windows
             goarch: amd64
             ext: '.exe'
-            archive: zip
           - name: windows-arm64
             goos: windows
             goarch: arm64
             ext: '.exe'
-            archive: zip
 
     steps:
       - uses: actions/checkout@v4
@@ -67,34 +61,20 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
         run: |
-          mkdir -p "dist/${{ matrix.name }}"
+          mkdir -p dist
           go build \
             -trimpath \
             -ldflags="-s -w" \
-            -o "dist/${{ matrix.name }}/gpt-image-mcp${{ matrix.ext }}" \
+            -o "dist/gpt-image-mcp-${{ matrix.name }}${{ matrix.ext }}" \
             .
-
-      - name: Package tar.gz
-        if: matrix.archive == 'tar'
-        run: |
-          tar -C "dist/${{ matrix.name }}" \
-            -czf "dist/gpt-image-mcp-${{ matrix.name }}.tar.gz" \
-            "gpt-image-mcp${{ matrix.ext }}"
-
-      - name: Package zip
-        if: matrix.archive == 'zip'
-        run: |
-          cd "dist/${{ matrix.name }}"
-          zip "../gpt-image-mcp-${{ matrix.name }}.zip" "gpt-image-mcp${{ matrix.ext }}"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: gpt-image-mcp-${{ matrix.name }}
-          path: |
-            dist/gpt-image-mcp-${{ matrix.name }}.tar.gz
-            dist/gpt-image-mcp-${{ matrix.name }}.zip
+          path: dist/gpt-image-mcp-${{ matrix.name }}${{ matrix.ext }}
           if-no-files-found: error
+          compression-level: 0
           retention-days: 14
 
   release:
