@@ -1,0 +1,127 @@
+name: build-binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            goos: linux
+            goarch: amd64
+            ext: ''
+            archive: tar
+          - name: linux-arm64
+            goos: linux
+            goarch: arm64
+            ext: ''
+            archive: tar
+          - name: darwin-amd64
+            goos: darwin
+            goarch: amd64
+            ext: ''
+            archive: tar
+          - name: darwin-arm64
+            goos: darwin
+            goarch: arm64
+            ext: ''
+            archive: tar
+          - name: windows-amd64
+            goos: windows
+            goarch: amd64
+            ext: '.exe'
+            archive: zip
+          - name: windows-arm64
+            goos: windows
+            goarch: arm64
+            ext: '.exe'
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: false
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p "dist/${{ matrix.name }}"
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o "dist/${{ matrix.name }}/gpt-image-mcp${{ matrix.ext }}" \
+            .
+
+      - name: Package tar.gz
+        if: matrix.archive == 'tar'
+        run: |
+          tar -C "dist/${{ matrix.name }}" \
+            -czf "dist/gpt-image-mcp-${{ matrix.name }}.tar.gz" \
+            "gpt-image-mcp${{ matrix.ext }}"
+
+      - name: Package zip
+        if: matrix.archive == 'zip'
+        run: |
+          cd "dist/${{ matrix.name }}"
+          zip "../gpt-image-mcp-${{ matrix.name }}.zip" "gpt-image-mcp${{ matrix.ext }}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpt-image-mcp-${{ matrix.name }}
+          path: |
+            dist/gpt-image-mcp-${{ matrix.name }}.tar.gz
+            dist/gpt-image-mcp-${{ matrix.name }}.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum gpt-image-mcp-* > SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/gpt-image-mcp-* \
+            dist/SHA256SUMS \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes
