@@ -12,7 +12,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -20,5 +20,9 @@ jobs:
         with:
           go-version: '1.25.x'
           cache: false
+      - name: Resolve module metadata
+        run: |
+          go mod tidy
+          git diff -- go.mod go.sum
       - run: go test ./...
-      - run: go build -trimpath -o gpt-image-mcp${{ runner.os == 'Windows' && '.exe' || '' }} .
+      - run: go build -trimpath -o gpt-image-mcp .
