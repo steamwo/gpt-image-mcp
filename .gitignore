@@ -1,0 +1,5 @@
+.env
+generated-images/
+gpt-image-mcp
+gpt-image-mcp.exe
+.DS_Store
