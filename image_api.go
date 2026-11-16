@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -67,9 +69,10 @@ type GeneratedImage struct {
 }
 
 type validatedFile struct {
-	Path string
-	Name string
-	Size int64
+	Path     string
+	Name     string
+	Size     int64
+	MIMEType string
 }
 
 func newImageClient(cfg Config) *ImageClient {
@@ -298,7 +301,15 @@ func writeMultipartFile(mw *multipart.Writer, field string, file validatedFile) 
 	}
 	defer src.Close()
 
-	part, err := mw.CreateFormFile(field, file.Name)
+	disposition := mime.FormatMediaType("form-data", map[string]string{
+		"name":     field,
+		"filename": file.Name,
+	})
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", disposition)
+	header.Set("Content-Type", file.MIMEType)
+
+	part, err := mw.CreatePart(header)
 	if err != nil {
 		return fmt.Errorf("create multipart file %s: %w", file.Name, err)
 	}
@@ -333,37 +344,68 @@ func (c *ImageClient) validateImagePath(raw string, maxBytes int64, pngOnly bool
 		return validatedFile{}, fmt.Errorf("image %q must be smaller than %d MiB", abs, maxBytes>>20)
 	}
 
-	ext := strings.ToLower(filepath.Ext(abs))
-	allowed := ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp"
-	if pngOnly {
-		allowed = ext == ".png"
-	}
-	if !allowed {
-		if pngOnly {
-			return validatedFile{}, fmt.Errorf("only PNG files are accepted: %s", abs)
-		}
-		return validatedFile{}, fmt.Errorf("unsupported image format %q; use PNG, JPEG, or WebP", ext)
-	}
-
 	f, err := os.Open(abs)
 	if err != nil {
 		return validatedFile{}, fmt.Errorf("open image %q: %w", abs, err)
 	}
 	defer f.Close()
+
 	header := make([]byte, 512)
-	n, _ := io.ReadFull(f, header)
+	n, err := f.Read(header)
+	if err != nil && err != io.EOF {
+		return validatedFile{}, fmt.Errorf("read image header %q: %w", abs, err)
+	}
 	if n == 0 {
 		return validatedFile{}, fmt.Errorf("image %q is empty", abs)
 	}
-	mime := http.DetectContentType(header[:n])
-	if pngOnly && mime != "image/png" {
-		return validatedFile{}, fmt.Errorf("mask is not a valid PNG: %s", abs)
-	}
-	if !pngOnly && mime != "image/png" && mime != "image/jpeg" && mime != "image/webp" {
-		return validatedFile{}, fmt.Errorf("file does not look like PNG, JPEG, or WebP: %s", abs)
+
+	mimeType := http.DetectContentType(header[:n])
+	if pngOnly {
+		if mimeType != "image/png" {
+			return validatedFile{}, fmt.Errorf("mask is not a valid PNG: %s", abs)
+		}
+	} else {
+		switch mimeType {
+		case "image/png", "image/jpeg", "image/webp":
+		default:
+			return validatedFile{}, fmt.Errorf("unsupported image MIME type %q for %s; use PNG, JPEG, or WebP", mimeType, abs)
+		}
 	}
 
-	return validatedFile{Path: abs, Name: filepath.Base(abs), Size: info.Size()}, nil
+	name := canonicalUploadName(filepath.Base(abs), mimeType)
+	return validatedFile{
+		Path:     abs,
+		Name:     name,
+		Size:     info.Size(),
+		MIMEType: mimeType,
+	}, nil
+}
+
+func canonicalUploadName(name, mimeType string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	validExt := false
+	canonicalExt := ""
+	switch mimeType {
+	case "image/png":
+		validExt = ext == ".png"
+		canonicalExt = ".png"
+	case "image/jpeg":
+		validExt = ext == ".jpg" || ext == ".jpeg"
+		canonicalExt = ".jpg"
+	case "image/webp":
+		validExt = ext == ".webp"
+		canonicalExt = ".webp"
+	}
+	if validExt || canonicalExt == "" {
+		return name
+	}
+	if ext != "" {
+		name = strings.TrimSuffix(name, filepath.Ext(name))
+	}
+	if name == "" {
+		name = "image"
+	}
+	return name + canonicalExt
 }
 
 func (c *ImageClient) checkAllowedPath(path string) error {
