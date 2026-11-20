@@ -17,40 +17,39 @@ type MCPServer struct {
 }
 
 type GenerateImageInput struct {
-	Prompt            string `json:"prompt" jsonschema:"Text description of the image to generate."`
-	Model             string `json:"model,omitempty" jsonschema:"Optional GPT Image model override. Defaults to GPT_IMAGE_MODEL."`
-	Size              string `json:"size,omitempty" jsonschema:"Optional output size, for example 1024x1024, 1536x1024, 1024x1536, auto, or a model-supported WIDTHxHEIGHT."`
-	Quality           string `json:"quality,omitempty" jsonschema:"Optional quality such as auto, low, medium, high, xhigh, or max when supported by the model."`
-	Background        string `json:"background,omitempty" jsonschema:"Optional background: auto, opaque, or transparent."`
-	OutputFormat      string `json:"output_format,omitempty" jsonschema:"Optional output format such as png, jpeg, webp, gif, or svg when supported."`
-	Complexity        string `json:"complexity,omitempty" jsonschema:"Optional planning complexity: low, medium, or high on supported GPT Image models."`
-	N                 int    `json:"n,omitempty" jsonschema:"Number of images to generate, from 1 to 10. Defaults to 1."`
-	OutputCompression *int   `json:"output_compression,omitempty" jsonschema:"Optional 0-100 compression level for JPEG or WebP outputs."`
-	SafetyIdentifier  string `json:"safety_identifier,omitempty" jsonschema:"Optional stable privacy-preserving end-user identifier for safety monitoring."`
+	Prompt      string `json:"prompt" jsonschema:"Describe the image to create. Usually this is the only required argument."`
+	Model       string `json:"model,omitempty" jsonschema:"Optional model override. Omit unless the user explicitly requested a model."`
+	Size        string `json:"size,omitempty" jsonschema:"Optional output size such as 1024x1024 or 1536x1024. Omit to let the image provider choose."`
+	Quality     string `json:"quality,omitempty" jsonschema:"Optional quality such as low, medium, high, or auto. Omit unless quality matters to the request."`
+	N           int    `json:"n,omitempty" jsonschema:"Number of images to generate, 1-10. Defaults to 1."`
+	Transparent bool   `json:"transparent,omitempty" jsonschema:"Set true only when the user explicitly needs a transparent background."`
 }
 
 type EditImageInput struct {
-	Prompt            string   `json:"prompt" jsonschema:"Describe the desired result and what should change or stay unchanged."`
-	ReferenceImages   []string `json:"reference_images" jsonschema:"Absolute local file paths or file:// URIs for 1-16 user-provided PNG, JPEG, or WebP reference images. When the user attached images in WorkBuddy, use their local attachment paths here."`
-	Mask              string   `json:"mask,omitempty" jsonschema:"Optional local PNG mask path. Transparent pixels indicate where the first reference image may be edited."`
-	Model             string   `json:"model,omitempty" jsonschema:"Optional GPT Image model override. Defaults to GPT_IMAGE_MODEL."`
-	Size              string   `json:"size,omitempty" jsonschema:"Optional output size, for example 1024x1024, 1536x1024, 1024x1536, auto, or a model-supported WIDTHxHEIGHT."`
-	Quality           string   `json:"quality,omitempty" jsonschema:"Optional quality such as auto, low, medium, high, xhigh, or max when supported by the model."`
-	Background        string   `json:"background,omitempty" jsonschema:"Optional background: auto, opaque, or transparent."`
-	OutputFormat      string   `json:"output_format,omitempty" jsonschema:"Optional output format such as png, jpeg, webp, gif, or svg when supported."`
-	Complexity        string   `json:"complexity,omitempty" jsonschema:"Optional planning complexity: low, medium, or high on supported GPT Image models."`
-	InputFidelity     string   `json:"input_fidelity,omitempty" jsonschema:"Optional input fidelity for older models that expose it. Omit for GPT-Image-2 and newer models unless your provider documents support."`
-	N                 int      `json:"n,omitempty" jsonschema:"Number of images to generate, from 1 to 10. Defaults to 1."`
-	OutputCompression *int     `json:"output_compression,omitempty" jsonschema:"Optional 0-100 compression level for JPEG or WebP outputs."`
-	SafetyIdentifier  string   `json:"safety_identifier,omitempty" jsonschema:"Optional stable privacy-preserving end-user identifier for safety monitoring."`
+	Prompt          string   `json:"prompt" jsonschema:"Describe the desired result, including what should change and what must stay unchanged."`
+	ReferenceImages []string `json:"reference_images" jsonschema:"One to sixteen image sources. Each source may be a local path, file:// URI, public HTTP(S) URL, or base64 data URI containing PNG, JPEG, or WebP."`
+	Mask            string   `json:"mask,omitempty" jsonschema:"Optional PNG mask source. It accepts the same source forms as reference_images. Transparent pixels indicate editable areas."`
+	Model           string   `json:"model,omitempty" jsonschema:"Optional model override. Omit unless the user explicitly requested a model."`
+	Size            string   `json:"size,omitempty" jsonschema:"Optional output size such as 1024x1024 or 1536x1024. Omit to let the image provider choose."`
+	Quality         string   `json:"quality,omitempty" jsonschema:"Optional quality such as low, medium, high, or auto. Omit unless quality matters to the request."`
+	N               int      `json:"n,omitempty" jsonschema:"Number of images to generate, 1-10. Defaults to 1."`
+	Transparent     bool     `json:"transparent,omitempty" jsonschema:"Set true only when the user explicitly needs a transparent background."`
+}
+
+type ImageArtifact struct {
+	Path          string `json:"path"`
+	MIMEType      string `json:"mime_type"`
+	SizeBytes     int64  `json:"size_bytes"`
+	RevisedPrompt string `json:"revised_prompt,omitempty"`
+	Embedded      bool   `json:"embedded_preview"`
 }
 
 type ImageToolOutput struct {
-	Files          []string `json:"files"`
-	Model          string   `json:"model"`
-	Count          int      `json:"count"`
-	RevisedPrompts []string `json:"revised_prompts,omitempty"`
-	Embedded       int      `json:"embedded_previews"`
+	Images          []ImageArtifact  `json:"images,omitempty"`
+	Model           string           `json:"model,omitempty"`
+	Count           int              `json:"count"`
+	ProviderProfile string           `json:"provider_profile"`
+	Error           *ToolErrorDetail `json:"error,omitempty"`
 }
 
 func newMCPServer(cfg Config, client *ImageClient) *MCPServer {
@@ -65,12 +64,12 @@ func newMCPServer(cfg Config, client *ImageClient) *MCPServer {
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "generate_image",
-		Description: "Generate one or more images from text using the configured GPT Image API. Use edit_image instead when the user supplies reference images.",
+		Description: "Generate images from text. Prefer calling with only prompt; use optional size, quality, model, n, or transparent only when the user request requires them. Use edit_image when reference images are provided.",
 	}, s.generateImage)
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name:        "edit_image",
-		Description: "Generate or edit images using 1-16 local reference images. Use this when the user attaches a reference image or asks to preserve visual details from existing images. Reference paths are read locally and sent to the configured /images/edits endpoint.",
+		Description: "Generate or edit images from 1-16 references. Reference images may be local paths, file URIs, public HTTP(S) URLs, or base64 data URIs. Prefer only prompt plus reference_images unless the user explicitly needs other controls.",
 	}, s.editImage)
 
 	return s
@@ -80,102 +79,130 @@ func (s *MCPServer) Run(ctx context.Context) error {
 	return s.server.Run(ctx, &mcp.StdioTransport{})
 }
 
-func (s *MCPServer) generateImage(ctx context.Context, _ *mcp.CallToolRequest, input GenerateImageInput) (*mcp.CallToolResult, any, error) {
-	images, model, err := s.client.Generate(ctx, input.Prompt, imageOptionsFromGenerate(input))
+func (s *MCPServer) generateImage(ctx context.Context, _ *mcp.CallToolRequest, input GenerateImageInput) (*mcp.CallToolResult, ImageToolOutput, error) {
+	opts := imageOptionsFromGenerate(input)
+	images, model, err := s.client.Generate(ctx, input.Prompt, opts)
 	if err != nil {
-		return toolError(err), nil, nil
+		return s.errorResult(err, s.effectiveModel(input.Model))
 	}
 	return s.successResult(images, model)
 }
 
-func (s *MCPServer) editImage(ctx context.Context, _ *mcp.CallToolRequest, input EditImageInput) (*mcp.CallToolResult, any, error) {
-	images, model, err := s.client.Edit(ctx, input.Prompt, input.ReferenceImages, input.Mask, imageOptionsFromEdit(input))
+func (s *MCPServer) editImage(ctx context.Context, _ *mcp.CallToolRequest, input EditImageInput) (*mcp.CallToolResult, ImageToolOutput, error) {
+	opts := imageOptionsFromEdit(input)
+	images, model, err := s.client.Edit(ctx, input.Prompt, input.ReferenceImages, input.Mask, opts)
 	if err != nil {
-		return toolError(err), nil, nil
+		return s.errorResult(err, s.effectiveModel(input.Model))
 	}
 	return s.successResult(images, model)
 }
 
 func imageOptionsFromGenerate(input GenerateImageInput) ImageOptions {
 	return ImageOptions{
-		Model:             input.Model,
-		Size:              input.Size,
-		Quality:           input.Quality,
-		Background:        input.Background,
-		OutputFormat:      input.OutputFormat,
-		Complexity:        input.Complexity,
-		SafetyIdentifier:  input.SafetyIdentifier,
-		N:                 input.N,
-		OutputCompression: input.OutputCompression,
+		Model:       input.Model,
+		Size:        input.Size,
+		Quality:     input.Quality,
+		N:           input.N,
+		Transparent: input.Transparent,
 	}
 }
 
 func imageOptionsFromEdit(input EditImageInput) ImageOptions {
 	return ImageOptions{
-		Model:             input.Model,
-		Size:              input.Size,
-		Quality:           input.Quality,
-		Background:        input.Background,
-		OutputFormat:      input.OutputFormat,
-		Complexity:        input.Complexity,
-		InputFidelity:     input.InputFidelity,
-		SafetyIdentifier:  input.SafetyIdentifier,
-		N:                 input.N,
-		OutputCompression: input.OutputCompression,
+		Model:       input.Model,
+		Size:        input.Size,
+		Quality:     input.Quality,
+		N:           input.N,
+		Transparent: input.Transparent,
 	}
 }
 
-func (s *MCPServer) successResult(images []GeneratedImage, model string) (*mcp.CallToolResult, any, error) {
+func (s *MCPServer) successResult(images []GeneratedImage, model string) (*mcp.CallToolResult, ImageToolOutput, error) {
 	if err := os.MkdirAll(s.cfg.OutputDir, 0o755); err != nil {
-		return toolError(fmt.Errorf("create output directory: %w", err)), nil, nil
+		return s.errorResult(fmt.Errorf("create output directory: %w", err), model)
 	}
 
-	output := ImageToolOutput{Model: model, Count: len(images)}
+	output := ImageToolOutput{
+		Model:           model,
+		Count:           len(images),
+		ProviderProfile: s.client.capabilities.Name,
+	}
 	content := make([]mcp.Content, 0, len(images)+1)
 	var embeddedBytes int64
+	paths := make([]string, 0, len(images))
 
 	for _, image := range images {
 		file, err := os.CreateTemp(s.cfg.OutputDir, "gpt-image-*"+image.Extension)
 		if err != nil {
-			return toolError(fmt.Errorf("create output file: %w", err)), nil, nil
+			return s.errorResult(fmt.Errorf("create output file: %w", err), model)
 		}
 		path := file.Name()
 		if _, err := file.Write(image.Bytes); err != nil {
 			_ = file.Close()
 			_ = os.Remove(path)
-			return toolError(fmt.Errorf("write output file: %w", err)), nil, nil
+			return s.errorResult(fmt.Errorf("write output file: %w", err), model)
 		}
 		if err := file.Close(); err != nil {
 			_ = os.Remove(path)
-			return toolError(fmt.Errorf("close output file: %w", err)), nil, nil
+			return s.errorResult(fmt.Errorf("close output file: %w", err), model)
 		}
-		abs, _ := filepath.Abs(path)
-		output.Files = append(output.Files, abs)
-		if strings.TrimSpace(image.RevisedPrompt) != "" {
-			output.RevisedPrompts = append(output.RevisedPrompts, image.RevisedPrompt)
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			abs = path
 		}
+		artifact := ImageArtifact{
+			Path:          abs,
+			MIMEType:      image.MIMEType,
+			SizeBytes:     int64(len(image.Bytes)),
+			RevisedPrompt: image.RevisedPrompt,
+		}
+		paths = append(paths, abs)
 
 		if s.cfg.EmbedMaxBytes > 0 && embeddedBytes+int64(len(image.Bytes)) <= s.cfg.EmbedMaxBytes {
 			content = append(content, &mcp.ImageContent{Data: image.Bytes, MIMEType: image.MIMEType})
 			embeddedBytes += int64(len(image.Bytes))
-			output.Embedded++
+			artifact.Embedded = true
 		}
+		output.Images = append(output.Images, artifact)
 	}
 
-	summary := fmt.Sprintf("Generated %d image(s) with %s. Saved locally:\n- %s", len(output.Files), model, strings.Join(output.Files, "\n- "))
-	if output.Embedded < len(output.Files) {
-		summary += fmt.Sprintf("\nEmbedded %d/%d preview(s); remaining images are available at the saved paths.", output.Embedded, len(output.Files))
+	summary := fmt.Sprintf("Generated %d image(s) with %s using %s profile. Saved locally:\n- %s", len(output.Images), model, output.ProviderProfile, strings.Join(paths, "\n- "))
+	embeddedCount := 0
+	for _, artifact := range output.Images {
+		if artifact.Embedded {
+			embeddedCount++
+		}
+	}
+	if embeddedCount < len(output.Images) {
+		summary += fmt.Sprintf("\nEmbedded %d/%d preview(s); all files are available at the saved paths.", embeddedCount, len(output.Images))
 	}
 	content = append([]mcp.Content{&mcp.TextContent{Text: summary}}, content...)
 
 	return &mcp.CallToolResult{Content: content}, output, nil
 }
 
-func toolError(err error) *mcp.CallToolResult {
+func (s *MCPServer) errorResult(err error, model string) (*mcp.CallToolResult, ImageToolOutput, error) {
+	detail := classifyToolError(err)
+	output := ImageToolOutput{
+		Model:           model,
+		ProviderProfile: s.client.capabilities.Name,
+		Error:           &detail,
+	}
+	text := detail.Message
+	if detail.Hint != "" {
+		text += " " + detail.Hint
+	}
 	return &mcp.CallToolResult{
 		IsError: true,
 		Content: []mcp.Content{
-			&mcp.TextContent{Text: err.Error()},
+			&mcp.TextContent{Text: text},
 		},
+	}, output, nil
+}
+
+func (s *MCPServer) effectiveModel(requested string) string {
+	if strings.TrimSpace(requested) != "" {
+		return strings.TrimSpace(requested)
 	}
+	return s.cfg.DefaultModel
 }

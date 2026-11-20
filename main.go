@@ -5,7 +5,7 @@ import (
 	"log"
 )
 
-const version = "0.1.0"
+var version = "dev"
 
 func main() {
 	cfg, err := loadConfig()

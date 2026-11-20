@@ -1,39 +1,26 @@
 # gpt-image-mcp
 
-一个轻量的本地 **stdio MCP Server**，让 WorkBuddy / CodeBuddy 使用你自己的 OpenAI API Key 或 OpenAI-compatible API 调用 GPT Image 生图。
+一个面向 Agent 的本地 **stdio MCP 图像能力适配器**。目标不是让 Agent 学会 OpenAI Images API，而是让本身不支持自定义生图模型调用的 Agent 只需要理解两个动作：
 
-重点：
+- `generate_image`：从文本生成图片
+- `edit_image`：基于参考图生成或编辑图片
 
-- Go 单二进制运行
-- 官方 MCP Go SDK
-- `generate_image`：文生图
-- `edit_image`：参考图生图 / 图片编辑
-- 支持 1–16 张本地参考图
+模型差异、OpenAI-compatible 网关差异、multipart、base64、附件路径、MIME、安全限制和结果落盘由 MCP 内部处理。
+
+## 特性
+
+- Go 单二进制，使用官方 MCP Go SDK
+- Agent-facing schema 保持简单：通常只需要 `prompt`
+- `edit_image` 支持 1–16 张参考图
+- 参考图支持本地路径、`file://`、公共 HTTP(S) URL、base64 data URI
 - 支持可选 PNG mask
-- 支持自定义 API Key、Base URL、模型、输出目录
-- 参考图直接读取 WorkBuddy 可访问的本地路径，不需要在线上传服务
-- 生成图片保存到本地，并在体积允许时作为 MCP image content 返回预览
-
-## 为什么用本地 MCP
-
-WorkBuddy 支持 stdio MCP，本地服务通过 stdin/stdout 与 WorkBuddy 通信。图片 API 请求由本机 MCP 发出，因此 API Key 不需要交给额外的在线 MCP 服务。
-
-参考图流程：
-
-```text
-WorkBuddy 附件 / 本地图片
-        ↓ local path
-edit_image(reference_images=[...])
-        ↓ multipart/form-data
-POST {OPENAI_BASE_URL}/images/edits
-        ↓
-生成图片保存到本地 + MCP 预览
-```
-
-## 要求
-
-- Go 1.25+（自行编译时）
-- 一个可用的 OpenAI API Key，或兼容 OpenAI Images API 的第三方服务
+- 自动 provider profile：OpenAI 官方端点使用完整能力，第三方端点默认使用兼容参数子集
+- API Key 可选，支持自定义 HTTP headers
+- 成功结果同时返回 MCP image content 和 typed structured output
+- 错误返回结构化 `code / retryable / parameter / status / hint`
+- 本地路径白名单会解析 symlink 后再检查
+- 远程参考图默认阻止 loopback、私网、link-local 地址，降低 SSRF 风险
+- 输出图片根据真实文件内容检测 MIME，不盲信扩展名或 provider 声明
 
 ## 构建
 
@@ -49,9 +36,7 @@ Windows：
 go build -trimpath -o gpt-image-mcp.exe .
 ```
 
-## WorkBuddy 配置
-
-WorkBuddy / CodeBuddy 的 MCP 配置支持 `stdio`：
+## MCP 配置示例
 
 ```jsonc
 {
@@ -64,124 +49,155 @@ WorkBuddy / CodeBuddy 的 MCP 配置支持 `stdio`：
         "OPENAI_BASE_URL": "https://api.openai.com/v1",
         "GPT_IMAGE_MODEL": "gpt-image-2.6-sunburst",
         "GPT_IMAGE_OUTPUT_DIR": "/absolute/path/to/generated-images"
-      },
-      "description": "Generate and edit images with GPT Image"
+      }
     }
   }
 }
 ```
 
-也可以用 WorkBuddy CLI 添加本地 MCP：
+本地或无鉴权的 OpenAI-compatible 服务可以不设置 `OPENAI_API_KEY`：
 
-```bash
-codebuddy mcp add --scope user gpt-image -- /absolute/path/to/gpt-image-mcp
+```jsonc
+"env": {
+  "OPENAI_BASE_URL": "http://127.0.0.1:8000/v1",
+  "GPT_IMAGE_MODEL": "my-image-model",
+  "GPT_IMAGE_PROFILE": "compatible"
+}
 ```
 
-API Key 等环境变量仍建议写入 MCP 配置的 `env`，不要提交到 Git。
+需要其他鉴权方式时：
+
+```jsonc
+"env": {
+  "OPENAI_BASE_URL": "https://gateway.example/v1",
+  "OPENAI_EXTRA_HEADERS_JSON": "{\"X-API-Key\":\"secret\"}",
+  "GPT_IMAGE_MODEL": "image-model"
+}
+```
 
 ## 工具
 
 ### `generate_image`
 
-从文本生成图片。
-
-常用参数：
+最小调用：
 
 ```json
 {
-  "prompt": "A cinematic photo of a rainy Tokyo alley at night",
-  "size": "1536x1024",
-  "quality": "high",
-  "n": 1
+  "prompt": "A cinematic photo of a rainy Tokyo alley at night"
 }
 ```
+
+可选参数：`model`、`size`、`quality`、`n`、`transparent`。
 
 ### `edit_image`
 
-使用参考图进行生成或编辑。`reference_images` 接受绝对路径或 `file://` URI：
-
 ```json
 {
-  "prompt": "Keep the subject unchanged, replace the background with a rainy Tokyo street at night",
+  "prompt": "Keep the subject unchanged and replace the background with a rainy Tokyo street at night",
   "reference_images": [
     "/absolute/path/reference.png"
-  ],
-  "quality": "high"
-}
-```
-
-多参考图：
-
-```json
-{
-  "prompt": "Create one product photo using all items from the reference images",
-  "reference_images": [
-    "/path/item-1.png",
-    "/path/item-2.jpg",
-    "/path/item-3.webp"
   ]
 }
 ```
 
-服务器会使用 OpenAI Images Edit API 的 `image[]` multipart 字段发送多张参考图。
-
-### Mask
-
-可选 `mask` 必须是 PNG，透明区域表示允许编辑的区域；mask 会作用于第一张参考图：
+参考图也可以混用不同来源：
 
 ```json
 {
-  "prompt": "Replace only the transparent masked area with a red sofa",
-  "reference_images": ["/path/room.png"],
-  "mask": "/path/mask.png"
+  "prompt": "Create one product photo using all referenced items",
+  "reference_images": [
+    "file:///path/item-1.png",
+    "https://example.com/item-2.jpg",
+    "data:image/png;base64,iVBORw0KGgo..."
+  ]
 }
 ```
 
-## 环境变量
+`mask` 接受相同的来源形式，但最终内容必须是 PNG。
 
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `OPENAI_API_KEY` | 无 | 必填；在工具调用时检查 |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | API 根地址，应包含 `/v1` |
-| `GPT_IMAGE_MODEL` | `gpt-image-2.6-sunburst` | 默认图片模型 |
-| `GPT_IMAGE_OUTPUT_DIR` | `./generated-images` | 生成图片目录 |
-| `GPT_IMAGE_TIMEOUT` | `10m` | 单次 API 请求超时 |
-| `GPT_IMAGE_EMBED_MAX_BYTES` | `8388608` | 单次 MCP 结果允许内嵌的图片总字节数；`0` 表示只返回文件路径 |
-| `GPT_IMAGE_ALLOWED_DIRS` | 空 | 可选参考图目录白名单；空表示允许读取任意本地图片路径 |
-| `OPENAI_ORGANIZATION` | 空 | 可选 `OpenAI-Organization` header |
-| `OPENAI_PROJECT` | 空 | 可选 `OpenAI-Project` header |
+## Provider profile
 
-第三方中转示例：
+`GPT_IMAGE_PROFILE` 控制 MCP 向下游 API 发送哪些可选参数：
 
-```jsonc
-"env": {
-  "OPENAI_API_KEY": "your-key",
-  "OPENAI_BASE_URL": "https://your-gateway.example/v1",
-  "GPT_IMAGE_MODEL": "your-supported-image-model"
+| Profile | 用途 |
+|---|---|
+| `auto` | 默认。api.openai.com 使用 `openai`，其他端点使用 `compatible` |
+| `openai` | 使用完整 OpenAI Images 参数能力 |
+| `compatible` | 面向常见 OpenAI-compatible 网关，只发送广泛支持的参数 |
+| `minimal` | 最大兼容模式，尽量只发送核心字段 |
+
+高级 provider-specific 参数不再暴露给 Agent，可通过环境变量设置，并且只会在当前 profile 支持时发送：
+
+```bash
+GPT_IMAGE_DEFAULT_BACKGROUND=auto
+GPT_IMAGE_DEFAULT_OUTPUT_FORMAT=png
+GPT_IMAGE_DEFAULT_COMPLEXITY=high
+GPT_IMAGE_DEFAULT_INPUT_FIDELITY=high
+GPT_IMAGE_DEFAULT_OUTPUT_COMPRESSION=90
+```
+
+## Structured output
+
+成功结果包含：
+
+```json
+{
+  "images": [
+    {
+      "path": "/.../gpt-image-123.png",
+      "mime_type": "image/png",
+      "size_bytes": 123456,
+      "embedded_preview": true
+    }
+  ],
+  "model": "gpt-image-2.6-sunburst",
+  "count": 1,
+  "provider_profile": "openai"
 }
 ```
 
-> 兼容性取决于中转服务是否真正实现 `/images/generations` 和 `/images/edits`，特别是 multipart 多参考图的 `image[]` 字段。
+错误会通过 MCP `IsError` 返回，并附带机器可读字段，例如 `invalid_input`、`authentication_failed`、`provider_busy`、`network_error`、`timeout`。
 
-## 本地文件安全
+## 安全设置
 
-`edit_image` 会把指定的本地参考图发送到你配置的图片 API。默认情况下，为了兼容 WorkBuddy 的附件临时目录，可以读取任意本地 PNG/JPEG/WebP 路径。
-
-如果你希望限制可读取目录，请设置：
+本地文件白名单：
 
 ```bash
 GPT_IMAGE_ALLOWED_DIRS=/allowed/uploads:/another/allowed/path
 ```
 
-Windows 使用 `;` 分隔多个目录。
+Windows 使用 `;` 分隔。路径会解析 symlink 后再检查。
 
-## 当前 GPT Image 模型
+远程参考图默认允许公共 HTTP(S) URL，但阻止 loopback、RFC1918/private、link-local 等地址。只有明确需要访问本机/内网附件服务时才开启：
 
-模型变化较快，所以模型名没有写死在工具逻辑中。默认值只是一个环境变量默认值，随时可以通过 `GPT_IMAGE_MODEL` 或每次工具调用的 `model` 参数覆盖。
+```bash
+GPT_IMAGE_ALLOW_PRIVATE_REMOTE_IMAGES=true
+```
+
+也可以完全关闭远程参考图：
+
+```bash
+GPT_IMAGE_ALLOW_REMOTE_IMAGES=false
+```
+
+## 主要环境变量
+
+| 变量 | 默认值 |
+|---|---|
+| `OPENAI_API_KEY` | 空，可选 |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` |
+| `GPT_IMAGE_MODEL` | `gpt-image-2.6-sunburst` |
+| `GPT_IMAGE_PROFILE` | `auto` |
+| `GPT_IMAGE_OUTPUT_DIR` | `./generated-images` |
+| `GPT_IMAGE_TIMEOUT` | `10m` |
+| `GPT_IMAGE_EMBED_MAX_BYTES` | `8388608` |
+| `GPT_IMAGE_ALLOW_REMOTE_IMAGES` | `true` |
+| `GPT_IMAGE_ALLOW_PRIVATE_REMOTE_IMAGES` | `false` |
 
 ## 开发
 
 ```bash
+go vet ./...
 go test ./...
 go build ./...
 ```
