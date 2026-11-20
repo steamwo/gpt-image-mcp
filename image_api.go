@@ -12,10 +12,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
-	"net/url"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 )
@@ -31,20 +28,22 @@ const (
 )
 
 type ImageClient struct {
-	cfg        Config
-	httpClient *http.Client
+	cfg                 Config
+	capabilities        ProviderCapabilities
+	httpClient          *http.Client
+	referenceHTTPClient *http.Client
 }
 
 type ImageOptions struct {
 	Model             string
 	Size              string
 	Quality           string
+	N                 int
+	Transparent       bool
 	Background        string
 	OutputFormat      string
 	Complexity        string
 	InputFidelity     string
-	SafetyIdentifier  string
-	N                 int
 	OutputCompression *int
 }
 
@@ -77,24 +76,28 @@ type validatedFile struct {
 
 func newImageClient(cfg Config) *ImageClient {
 	return &ImageClient{
-		cfg: cfg,
+		cfg:          cfg,
+		capabilities: providerCapabilities(cfg),
 		httpClient: &http.Client{
 			Timeout: cfg.Timeout,
 		},
+		referenceHTTPClient: newReferenceHTTPClient(cfg),
 	}
 }
 
 func (c *ImageClient) Generate(ctx context.Context, prompt string, opts ImageOptions) ([]GeneratedImage, string, error) {
-	if err := c.validateCommon(prompt, &opts); err != nil {
+	if err := c.validateCommon(prompt, &opts, false); err != nil {
 		return nil, "", err
 	}
 
 	payload := map[string]any{
 		"model":  opts.Model,
-		"prompt": prompt,
-		"n":      opts.N,
+		"prompt": strings.TrimSpace(prompt),
 	}
-	addOptionalFields(payload, opts, false)
+	if c.capabilities.N {
+		payload["n"] = opts.N
+	}
+	addOptionalFields(payload, opts, false, c.capabilities)
 
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -118,24 +121,30 @@ func (c *ImageClient) Generate(ctx context.Context, prompt string, opts ImageOpt
 	if err != nil {
 		return nil, "", err
 	}
-	images, err := c.materializeImages(ctx, parsed, opts.OutputFormat)
+	images, err := c.materializeImages(ctx, parsed)
 	if err != nil {
 		return nil, "", err
 	}
 	return images, opts.Model, nil
 }
 
-func (c *ImageClient) Edit(ctx context.Context, prompt string, imagePaths []string, maskPath string, opts ImageOptions) ([]GeneratedImage, string, error) {
-	if err := c.validateCommon(prompt, &opts); err != nil {
+func (c *ImageClient) Edit(ctx context.Context, prompt string, imageSources []string, maskSource string, opts ImageOptions) ([]GeneratedImage, string, error) {
+	if err := c.validateCommon(prompt, &opts, true); err != nil {
 		return nil, "", err
 	}
-	if len(imagePaths) == 0 || len(imagePaths) > maxReferenceImages {
-		return nil, "", fmt.Errorf("reference_images must contain between 1 and %d images", maxReferenceImages)
+	if len(imageSources) == 0 || len(imageSources) > maxReferenceImages {
+		return nil, "", &InputError{Parameter: "reference_images", Message: fmt.Sprintf("must contain between 1 and %d images", maxReferenceImages)}
 	}
 
-	refs := make([]validatedFile, 0, len(imagePaths))
-	for _, path := range imagePaths {
-		file, err := c.validateImagePath(path, maxReferenceImageBytes, false)
+	tempDir, err := os.MkdirTemp("", "gpt-image-mcp-input-*")
+	if err != nil {
+		return nil, "", fmt.Errorf("create temporary input directory: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	refs := make([]validatedFile, 0, len(imageSources))
+	for _, source := range imageSources {
+		file, err := c.resolveImageSource(ctx, source, maxReferenceImageBytes, false, tempDir)
 		if err != nil {
 			return nil, "", err
 		}
@@ -143,8 +152,8 @@ func (c *ImageClient) Edit(ctx context.Context, prompt string, imagePaths []stri
 	}
 
 	var mask *validatedFile
-	if strings.TrimSpace(maskPath) != "" {
-		file, err := c.validateImagePath(maskPath, maxMaskBytes, true)
+	if strings.TrimSpace(maskSource) != "" {
+		file, err := c.resolveImageSource(ctx, maskSource, maxMaskBytes, true, tempDir)
 		if err != nil {
 			return nil, "", fmt.Errorf("mask: %w", err)
 		}
@@ -164,15 +173,16 @@ func (c *ImageClient) Edit(ctx context.Context, prompt string, imagePaths []stri
 	c.setHeaders(req)
 
 	go func() {
-		err := writeEditMultipart(mw, prompt, refs, mask, opts)
-		if closeErr := mw.Close(); err == nil {
-			err = closeErr
+		writeErr := writeEditMultipart(mw, strings.TrimSpace(prompt), refs, mask, opts, c.capabilities)
+		if closeErr := mw.Close(); writeErr == nil {
+			writeErr = closeErr
 		}
-		_ = pw.CloseWithError(err)
+		_ = pw.CloseWithError(writeErr)
 	}()
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		_ = pr.CloseWithError(err)
 		return nil, "", fmt.Errorf("image edit request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -181,97 +191,125 @@ func (c *ImageClient) Edit(ctx context.Context, prompt string, imagePaths []stri
 	if err != nil {
 		return nil, "", err
 	}
-	images, err := c.materializeImages(ctx, parsed, opts.OutputFormat)
+	images, err := c.materializeImages(ctx, parsed)
 	if err != nil {
 		return nil, "", err
 	}
 	return images, opts.Model, nil
 }
 
-func (c *ImageClient) validateCommon(prompt string, opts *ImageOptions) error {
+func (c *ImageClient) validateCommon(prompt string, opts *ImageOptions, editing bool) error {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
-		return errors.New("prompt is required")
+		return &InputError{Parameter: "prompt", Message: "is required"}
 	}
 	if len([]rune(prompt)) > maxPromptRunes {
-		return fmt.Errorf("prompt exceeds %d characters", maxPromptRunes)
-	}
-	if strings.TrimSpace(c.cfg.APIKey) == "" {
-		return errors.New("OPENAI_API_KEY is not set")
+		return &InputError{Parameter: "prompt", Message: fmt.Sprintf("exceeds %d characters", maxPromptRunes)}
 	}
 	if strings.TrimSpace(opts.Model) == "" {
 		opts.Model = c.cfg.DefaultModel
+	}
+	if strings.TrimSpace(opts.Model) == "" {
+		return &InputError{Parameter: "model", Message: "no image model is configured"}
 	}
 	if opts.N == 0 {
 		opts.N = defaultGeneratedImageCount
 	}
 	if opts.N < 1 || opts.N > 10 {
-		return errors.New("n must be between 1 and 10")
+		return &InputError{Parameter: "n", Message: "must be between 1 and 10"}
+	}
+	if opts.N != 1 && !c.capabilities.N {
+		return &InputError{Parameter: "n", Message: fmt.Sprintf("provider profile %q does not support requesting multiple images", c.capabilities.Name)}
+	}
+	if opts.Size != "" && !c.capabilities.Size {
+		return &InputError{Parameter: "size", Message: fmt.Sprintf("provider profile %q does not expose size", c.capabilities.Name)}
+	}
+	if opts.Quality != "" && !c.capabilities.Quality {
+		return &InputError{Parameter: "quality", Message: fmt.Sprintf("provider profile %q does not expose quality", c.capabilities.Name)}
+	}
+	if opts.Transparent {
+		if !c.capabilities.Background || !c.capabilities.OutputFormat {
+			return &InputError{Parameter: "transparent", Message: fmt.Sprintf("provider profile %q does not expose transparent output", c.capabilities.Name)}
+		}
+		opts.Background = "transparent"
+		opts.OutputFormat = "png"
+	}
+
+	if c.capabilities.Background && opts.Background == "" {
+		opts.Background = c.cfg.Defaults.Background
+	}
+	if c.capabilities.OutputFormat && opts.OutputFormat == "" {
+		opts.OutputFormat = c.cfg.Defaults.OutputFormat
+	}
+	if c.capabilities.Complexity {
+		opts.Complexity = c.cfg.Defaults.Complexity
+	}
+	if editing && c.capabilities.InputFidelity {
+		opts.InputFidelity = c.cfg.Defaults.InputFidelity
+	}
+	if c.capabilities.OutputCompression {
+		opts.OutputCompression = c.cfg.Defaults.OutputCompression
 	}
 	if opts.OutputCompression != nil && (*opts.OutputCompression < 0 || *opts.OutputCompression > 100) {
-		return errors.New("output_compression must be between 0 and 100")
+		return &InputError{Parameter: "output_compression", Message: "must be between 0 and 100"}
 	}
 	if opts.Background == "transparent" && opts.OutputFormat != "" && opts.OutputFormat != "png" && opts.OutputFormat != "webp" {
-		return errors.New("transparent background requires output_format png or webp")
+		return &InputError{Parameter: "output_format", Message: "transparent background requires png or webp"}
 	}
 	return nil
 }
 
-func addOptionalFields(payload map[string]any, opts ImageOptions, editing bool) {
-	if opts.Size != "" {
+func addOptionalFields(payload map[string]any, opts ImageOptions, editing bool, caps ProviderCapabilities) {
+	if caps.Size && opts.Size != "" {
 		payload["size"] = opts.Size
 	}
-	if opts.Quality != "" {
+	if caps.Quality && opts.Quality != "" {
 		payload["quality"] = opts.Quality
 	}
-	if opts.Background != "" {
+	if caps.Background && opts.Background != "" {
 		payload["background"] = opts.Background
 	}
-	if opts.OutputFormat != "" {
+	if caps.OutputFormat && opts.OutputFormat != "" {
 		payload["output_format"] = opts.OutputFormat
 	}
-	if opts.Complexity != "" {
+	if caps.Complexity && opts.Complexity != "" {
 		payload["complexity"] = opts.Complexity
 	}
-	if editing && opts.InputFidelity != "" {
+	if editing && caps.InputFidelity && opts.InputFidelity != "" {
 		payload["input_fidelity"] = opts.InputFidelity
 	}
-	if opts.SafetyIdentifier != "" {
-		payload["safety_identifier"] = opts.SafetyIdentifier
-	}
-	if opts.OutputCompression != nil {
+	if caps.OutputCompression && opts.OutputCompression != nil {
 		payload["output_compression"] = *opts.OutputCompression
 	}
 }
 
-func writeEditMultipart(mw *multipart.Writer, prompt string, refs []validatedFile, mask *validatedFile, opts ImageOptions) error {
+func writeEditMultipart(mw *multipart.Writer, prompt string, refs []validatedFile, mask *validatedFile, opts ImageOptions, caps ProviderCapabilities) error {
 	fields := map[string]string{
 		"model":  opts.Model,
 		"prompt": prompt,
-		"n":      strconv.Itoa(opts.N),
 	}
-	if opts.Size != "" {
+	if caps.N {
+		fields["n"] = strconv.Itoa(opts.N)
+	}
+	if caps.Size && opts.Size != "" {
 		fields["size"] = opts.Size
 	}
-	if opts.Quality != "" {
+	if caps.Quality && opts.Quality != "" {
 		fields["quality"] = opts.Quality
 	}
-	if opts.Background != "" {
+	if caps.Background && opts.Background != "" {
 		fields["background"] = opts.Background
 	}
-	if opts.OutputFormat != "" {
+	if caps.OutputFormat && opts.OutputFormat != "" {
 		fields["output_format"] = opts.OutputFormat
 	}
-	if opts.Complexity != "" {
+	if caps.Complexity && opts.Complexity != "" {
 		fields["complexity"] = opts.Complexity
 	}
-	if opts.InputFidelity != "" {
+	if caps.InputFidelity && opts.InputFidelity != "" {
 		fields["input_fidelity"] = opts.InputFidelity
 	}
-	if opts.SafetyIdentifier != "" {
-		fields["safety_identifier"] = opts.SafetyIdentifier
-	}
-	if opts.OutputCompression != nil {
+	if caps.OutputCompression && opts.OutputCompression != nil {
 		fields["output_compression"] = strconv.Itoa(*opts.OutputCompression)
 	}
 
@@ -280,7 +318,6 @@ func writeEditMultipart(mw *multipart.Writer, prompt string, refs []validatedFil
 			return fmt.Errorf("write multipart field %s: %w", key, err)
 		}
 	}
-
 	for _, ref := range refs {
 		if err := writeMultipartFile(mw, "image[]", ref); err != nil {
 			return err
@@ -319,141 +356,21 @@ func writeMultipartFile(mw *multipart.Writer, field string, file validatedFile) 
 	return nil
 }
 
-func (c *ImageClient) validateImagePath(raw string, maxBytes int64, pngOnly bool) (validatedFile, error) {
-	path, err := normalizeLocalPath(raw)
-	if err != nil {
-		return validatedFile{}, err
-	}
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return validatedFile{}, fmt.Errorf("resolve image path %q: %w", raw, err)
-	}
-	abs = filepath.Clean(abs)
-	if err := c.checkAllowedPath(abs); err != nil {
-		return validatedFile{}, err
-	}
-
-	info, err := os.Stat(abs)
-	if err != nil {
-		return validatedFile{}, fmt.Errorf("read image %q: %w", abs, err)
-	}
-	if !info.Mode().IsRegular() {
-		return validatedFile{}, fmt.Errorf("image path is not a regular file: %s", abs)
-	}
-	if info.Size() <= 0 || info.Size() >= maxBytes {
-		return validatedFile{}, fmt.Errorf("image %q must be smaller than %d MiB", abs, maxBytes>>20)
-	}
-
-	f, err := os.Open(abs)
-	if err != nil {
-		return validatedFile{}, fmt.Errorf("open image %q: %w", abs, err)
-	}
-	defer f.Close()
-
-	header := make([]byte, 512)
-	n, err := f.Read(header)
-	if err != nil && err != io.EOF {
-		return validatedFile{}, fmt.Errorf("read image header %q: %w", abs, err)
-	}
-	if n == 0 {
-		return validatedFile{}, fmt.Errorf("image %q is empty", abs)
-	}
-
-	mimeType := http.DetectContentType(header[:n])
-	if pngOnly {
-		if mimeType != "image/png" {
-			return validatedFile{}, fmt.Errorf("mask is not a valid PNG: %s", abs)
-		}
-	} else {
-		switch mimeType {
-		case "image/png", "image/jpeg", "image/webp":
-		default:
-			return validatedFile{}, fmt.Errorf("unsupported image MIME type %q for %s; use PNG, JPEG, or WebP", mimeType, abs)
-		}
-	}
-
-	name := canonicalUploadName(filepath.Base(abs), mimeType)
-	return validatedFile{
-		Path:     abs,
-		Name:     name,
-		Size:     info.Size(),
-		MIMEType: mimeType,
-	}, nil
-}
-
-func canonicalUploadName(name, mimeType string) string {
-	ext := strings.ToLower(filepath.Ext(name))
-	validExt := false
-	canonicalExt := ""
-	switch mimeType {
-	case "image/png":
-		validExt = ext == ".png"
-		canonicalExt = ".png"
-	case "image/jpeg":
-		validExt = ext == ".jpg" || ext == ".jpeg"
-		canonicalExt = ".jpg"
-	case "image/webp":
-		validExt = ext == ".webp"
-		canonicalExt = ".webp"
-	}
-	if validExt || canonicalExt == "" {
-		return name
-	}
-	if ext != "" {
-		name = strings.TrimSuffix(name, filepath.Ext(name))
-	}
-	if name == "" {
-		name = "image"
-	}
-	return name + canonicalExt
-}
-
-func (c *ImageClient) checkAllowedPath(path string) error {
-	if len(c.cfg.AllowedDirs) == 0 {
-		return nil
-	}
-	for _, root := range c.cfg.AllowedDirs {
-		rel, err := filepath.Rel(root, path)
-		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
-			return nil
-		}
-	}
-	return fmt.Errorf("image path %q is outside GPT_IMAGE_ALLOWED_DIRS", path)
-}
-
-func normalizeLocalPath(raw string) (string, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", errors.New("empty image path")
-	}
-	if !strings.HasPrefix(strings.ToLower(raw), "file://") {
-		return raw, nil
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "", fmt.Errorf("invalid file URI %q: %w", raw, err)
-	}
-	path, err := url.PathUnescape(u.Path)
-	if err != nil {
-		return "", fmt.Errorf("invalid file URI path %q: %w", raw, err)
-	}
-	if u.Host != "" && u.Host != "localhost" {
-		path = "//" + u.Host + path
-	}
-	if runtime.GOOS == "windows" && len(path) >= 3 && path[0] == '/' && path[2] == ':' {
-		path = path[1:]
-	}
-	return filepath.FromSlash(path), nil
-}
-
 func (c *ImageClient) setHeaders(req *http.Request) {
-	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+	if strings.TrimSpace(c.cfg.APIKey) != "" {
+		req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+	}
 	req.Header.Set("Accept", "application/json")
 	if c.cfg.Organization != "" {
 		req.Header.Set("OpenAI-Organization", c.cfg.Organization)
 	}
 	if c.cfg.Project != "" {
 		req.Header.Set("OpenAI-Project", c.cfg.Project)
+	}
+	for key, value := range c.cfg.ExtraHeaders {
+		if strings.TrimSpace(key) != "" {
+			req.Header.Set(key, value)
+		}
 	}
 }
 
@@ -489,7 +406,12 @@ func apiError(status int, body []byte) error {
 		} `json:"error"`
 	}
 	if json.Unmarshal(body, &envelope) == nil && envelope.Error.Message != "" {
-		return fmt.Errorf("image API returned HTTP %d: %s", status, envelope.Error.Message)
+		return &APIError{
+			Status:  status,
+			Message: envelope.Error.Message,
+			Type:    envelope.Error.Type,
+			Code:    fmt.Sprint(envelope.Error.Code),
+		}
 	}
 	message := strings.TrimSpace(string(body))
 	if len(message) > 1000 {
@@ -498,24 +420,19 @@ func apiError(status int, body []byte) error {
 	if message == "" {
 		message = http.StatusText(status)
 	}
-	return fmt.Errorf("image API returned HTTP %d: %s", status, message)
+	return &APIError{Status: status, Message: message}
 }
 
-func (c *ImageClient) materializeImages(ctx context.Context, response ImageResponse, requestedFormat string) ([]GeneratedImage, error) {
-	format := strings.ToLower(strings.TrimSpace(response.OutputFormat))
-	if format == "" {
-		format = strings.ToLower(strings.TrimSpace(requestedFormat))
-	}
-	if format == "" {
-		format = "png"
-	}
-
+func (c *ImageClient) materializeImages(ctx context.Context, response ImageResponse) ([]GeneratedImage, error) {
 	result := make([]GeneratedImage, 0, len(response.Data))
 	for i, item := range response.Data {
 		var imageBytes []byte
 		var err error
 		switch {
 		case item.B64JSON != "":
+			if int64(base64.StdEncoding.DecodedLen(len(item.B64JSON))) > maxDownloadedImageBytes {
+				return nil, fmt.Errorf("image %d exceeds %d MiB decoded size limit", i+1, maxDownloadedImageBytes>>20)
+			}
 			imageBytes, err = base64.StdEncoding.DecodeString(item.B64JSON)
 			if err != nil {
 				return nil, fmt.Errorf("decode image %d: %w", i+1, err)
@@ -529,7 +446,10 @@ func (c *ImageClient) materializeImages(ctx context.Context, response ImageRespo
 			return nil, fmt.Errorf("image %d has neither b64_json nor url", i+1)
 		}
 
-		mimeType, ext := outputType(format, imageBytes)
+		mimeType, ext, err := detectOutputType(imageBytes)
+		if err != nil {
+			return nil, fmt.Errorf("image %d: %w", i+1, err)
+		}
 		result = append(result, GeneratedImage{
 			Bytes:         imageBytes,
 			MIMEType:      mimeType,
@@ -563,30 +483,25 @@ func (c *ImageClient) downloadImage(ctx context.Context, imageURL string) ([]byt
 	return data, nil
 }
 
-func outputType(format string, data []byte) (mimeType, ext string) {
-	switch strings.ToLower(format) {
-	case "png":
-		return "image/png", ".png"
-	case "jpeg", "jpg":
-		return "image/jpeg", ".jpg"
-	case "webp":
-		return "image/webp", ".webp"
-	case "gif":
-		return "image/gif", ".gif"
-	case "svg":
-		return "image/svg+xml", ".svg"
+func detectOutputType(data []byte) (mimeType, ext string, err error) {
+	if len(data) == 0 {
+		return "", "", errors.New("image data is empty")
 	}
 	mimeType = http.DetectContentType(data)
 	switch mimeType {
 	case "image/png":
-		return mimeType, ".png"
+		return mimeType, ".png", nil
 	case "image/jpeg":
-		return mimeType, ".jpg"
+		return mimeType, ".jpg", nil
 	case "image/webp":
-		return mimeType, ".webp"
+		return mimeType, ".webp", nil
 	case "image/gif":
-		return mimeType, ".gif"
-	default:
-		return mimeType, ".bin"
+		return mimeType, ".gif", nil
 	}
+
+	trimmed := strings.TrimSpace(string(data))
+	if strings.HasPrefix(trimmed, "<svg") || (strings.HasPrefix(trimmed, "<?xml") && strings.Contains(trimmed[:min(len(trimmed), 1024)], "<svg")) {
+		return "image/svg+xml", ".svg", nil
+	}
+	return "", "", fmt.Errorf("API returned non-image content of type %q", mimeType)
 }

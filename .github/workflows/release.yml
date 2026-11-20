@@ -53,7 +53,9 @@ jobs:
           cache: false
 
       - name: Test
-        run: go test ./...
+        run: |
+          go vet ./...
+          go test ./...
 
       - name: Build
         env:
@@ -62,9 +64,14 @@ jobs:
           CGO_ENABLED: '0'
         run: |
           mkdir -p dist
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="dev-${GITHUB_SHA::7}"
+          fi
           go build \
             -trimpath \
-            -ldflags="-s -w" \
+            -ldflags="-s -w -X main.version=${VERSION}" \
             -o "dist/gpt-image-mcp-${{ matrix.name }}${{ matrix.ext }}" \
             .
 

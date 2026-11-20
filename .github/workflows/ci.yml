@@ -20,5 +20,16 @@ jobs:
         with:
           go-version: '1.25.x'
           cache: false
+      - run: go vet ./...
       - run: go test ./...
       - run: go build -trimpath -o gpt-image-mcp${{ runner.os == 'Windows' && '.exe' || '' }} .
+
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: false
+      - run: go test -race ./...
